@@ -1,0 +1,17 @@
+version: "0.1"
+services:
+
+  orthanc:
+    build: orthanc
+    ports: ["8042:8042"]
+    environment:
+      ORTHANC__NAME: "ai-orchestrator"
+
+      VERBOSE_ENABLED: "true"
+      VERBOSE_STARTUP: "true"
+      ORTHANC__PYTHON_SCRIPT: "/python/ai-orchestrator.py"
+      ORTHANC__PYTHON_VERBOSE: "true"
+
+      ORTHANC__AUTHENTICATION_ENABLED: "false"
+      ORTHANC__HTTP_DESCRIBE_ERRORS: "true"
+      ORTHANC__STABLE_AGE: 5
