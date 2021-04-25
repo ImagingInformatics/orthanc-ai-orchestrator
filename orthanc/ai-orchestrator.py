@@ -1,9 +1,7 @@
-import orthanc,pprint,json,datetime,random
+import orthanc,pprint,json,datetime,random,sys
 
-#TODO store things into the DB?
-#TODO check that the study is not already listed as a workitem when adding a new one
+#TODO store things into the DB
 #TODO set a timer to automatically expire workitems after a given amount of time?
-#TODO Add method checks to enfore GET vs. POST vs. PUT
 
 ###############################################################################
 # GLOBALS
@@ -14,22 +12,61 @@ STATE_SCHEDULED = "SCHEDULED"
 STATE_IN_PROGRESS = "IN PROGRESS"
 STATE_COMPLETED = "COMPLETED"
 STATE_CANCELED = "CANCELED"
-
+STATES = [STATE_SCHEDULED, STATE_CANCELED, STATE_COMPLETED, STATE_IN_PROGRESS]
+REQUIRED_TAGS = ['00080016','00080018','00081195','00081199','00100010','00100020','00100030','00100040','0020000D','00404041','0040A370','0040E025','00404005','00741000','00741200','00741204']
 
 ###############################################################################
 # ORTHANC EVENT HOOKS
 ###############################################################################
 # List all work
-#TODO Add support for filtering via a GET query
-def listWorkitems(output, uri, **request):
-    output.AnswerBuffer(json.dumps(list(WORKITEMS.values())), 'application/dicom+json')
+def listOrCreateWorkitems(output, uri, **request):
+    if request['method'] == 'GET':
+        #TODO Add support for filtering via a GET query
+        output.AnswerBuffer(json.dumps(list(WORKITEMS.values())), 'application/dicom+json')
 
-orthanc.RegisterRestCallback('/ai-orchestrator/workitems', listWorkitems)
+    if request['method'] == 'POST':
+        try:
+            workitem = json.loads(request['body'])
+            missingAttributes = checkRequiredTagsPresent(workitem)
+
+            # Check this new object has the bare-minimum tags/attributes
+            if len(missingAttributes) > 0:
+                msg = "Your new object is missing the following attribute(s): " + ", ".join(missingAttributes)
+                output.SendHttpStatus(400, msg, len(msg))
+                return
+
+            # Check this study is NOT already listed
+            if checkStudyUIDExists(workitem['0020000D']['Value'][0]):
+                msg = "This study is already listed as a workitem"
+                output.SendHttpStatus(400, msg, len(msg))
+                return
+
+            # If all successfull so far, store the item
+            workitemId = getDicomIdentifier()
+            WORKITEMS[workitemId] = workitem
+            output.AnswerBuffer(json.dumps(WORKITEMS[workitemId]), 'application/dicom+json')
+
+        except:
+            errorInfo = sys.exc_info()
+            msg = "Unknown error occurred, might be caused by invalid data input. Error message was: " + errorInfo[0]
+            print("Unhandled error while attempting to create a workitem manually: " + errorInfo[0])
+            print(errorInfo[2])
+            output.SendHttpStatus(500, msg, len(msg))
+            return
+
+    else:
+        output.SendMethodNotAllowed('GET,POST')
+        return
+
+orthanc.RegisterRestCallback('/ai-orchestrator/workitems', listOrCreateWorkitems)
 
 def getWorkitem(output, uri, **request):
+    if request['method'] != 'GET':
+        output.SendMethodNotAllowed('GET')
+        return
+
     workitemId = request['groups'][0]
     if (workitemId not in WORKITEMS):
-        print('aaaaaaaaaaaaaaaa')
         msg = "No workitem found matching the ID supplied: " + workitemId
         output.SendHttpStatus(404, msg, len(msg))
         return
@@ -39,14 +76,46 @@ orthanc.RegisterRestCallback('/ai-orchestrator/workitems/([0-9\\.]*)', getWorkit
 
 
 def changeWorkItemState(output, uri, **request):
+    if request['method'] != 'PUT':
+        output.SendMethodNotAllowed('PUT')
+        return
+
     workitemId = request['groups'][0]
     if (workitemId not in WORKITEMS):
-        print('bbbbbbbbbbbbbbbb')
         msg = "No workitem found matching the ID supplied: " + workitemId
         output.SendHttpStatus(404, msg, len(msg))
         return
-    print(request['body'])
-    WORKITEMS[workitemId] = json.loads(request['body'])
+    # Check the integrity of the new object
+    new = json.loads(request['body'])
+    old = WORKITEMS[workitemId]
+    missingAttributes = checkRequiredTagsPresent(new)
+
+    # Check this new object has the bare-minimum tags/attributes
+    if len(missingAttributes) > 0:
+        msg = "Your new object is missing the following attribute(s): " + ", ".join(missingAttributes)
+        output.SendHttpStatus(400, msg, len(msg))
+        return
+
+    # Next check, the status should be one of the known statuses
+    if new['00741000']['Value'][0] not in STATES:
+        msg = "Your object's ProcedureStepState (00741000) must be one of: " + ", ".join(STATES)
+        output.SendHttpStatus(400, msg, len(msg))
+        return
+
+    # Check the correct succession of states (scheduled -> in progress (OR canceled) -> completed OR canceled)
+    oldState = old['00741000']['Value'][0]
+    newState = new['00741000']['Value'][0]
+    if oldState == STATE_SCHEDULED and (newState != STATE_IN_PROGRESS and newState != STATE_CANCELED):
+        msg = "A workitem that is currently in SCHEDULED state can only move to IN PROGRESS or CANCELED"
+        output.SendHttpStatus(400, msg, len(msg))
+        return
+    if oldState == STATE_IN_PROGRESS and (newState != STATE_COMPLETED and newState != STATE_CANCELED):
+        msg = "A workitem that is currently in IN PROGRESS state can only move to COMPLETED or CANCELED"
+        output.SendHttpStatus(400, msg, len(msg))
+        return
+
+    # If successful - store the new object
+    WORKITEMS[workitemId] = new
     output.AnswerBuffer(json.dumps(WORKITEMS[workitemId]), 'application/dicom+json')
 
 orthanc.RegisterRestCallback('/ai-orchestrator/workitems/([0-9\\.]*)/state', changeWorkItemState)
@@ -58,12 +127,18 @@ def OnChange(changeType, level, resourceId):
 
     if changeType == orthanc.ChangeType.STABLE_STUDY: # Study has stopped receiving news instances/series
         print('Stable study: %s' % resourceId)
+
         # Get more information about this study
         study = json.loads(orthanc.RestApiGet('/studies/' + resourceId))
         studyUid = study['MainDicomTags']['StudyInstanceUID']
         series = []
         bodyPart = None
         modality = None
+
+        # Check this study is NOT already listed
+        if checkStudyUIDExists(studyUid):
+            print("This study is already listed as a workitem")
+            return
 
         # Loop through the series within this study, and get additional attributes for each
         for seriesId in study['Series']:
@@ -72,7 +147,9 @@ def OnChange(changeType, level, resourceId):
             if( bodyPart == None ):
                 bodyPart = str(data['0018,0015']['Value'])
                 modality = str(data['0008,0060']['Value'])
-        pipline = bodyPart.lower() + '-' + modality.lower() + '-pipeline' # TODO improve this to be more dynamic
+
+        # TODO improve this to be more dynamic
+        pipline = bodyPart.lower() + '-' + modality.lower() + '-pipeline'
 
         # Create a workitem for this study
         workitemId = getDicomIdentifier()
@@ -108,7 +185,7 @@ def OnChange(changeType, level, resourceId):
                 '00081155': {'vr': 'UI', 'Value': [curSeries['0020,000e']['Value']]},  # ReferencedSeriesUID
             })
         WORKITEMS[workitemId] = workitem
-        pprint.pprint(workitem)
+        #pprint.pprint(workitem)
 
 orthanc.RegisterOnChangeCallback(OnChange)
 
@@ -116,6 +193,7 @@ orthanc.RegisterOnChangeCallback(OnChange)
 ###############################################################################
 # UTILITY METHODS
 ###############################################################################
+# Create a random DICOM UID
 def getDicomIdentifier():
     uid = DICOM_UID_ROOT
     parts = random.randint(3,6)
@@ -125,8 +203,23 @@ def getDicomIdentifier():
         i += 1
     return uid
 
+# Return DICOM-formatted date. If not date provided, it defaults to now
 def getDicomDate(date=None):
     if( date == None ):
         date = datetime.datetime.now()
     return date.strftime('%Y%m%d%H%M%S')
 
+# Check a given study is NOT already listed
+def checkStudyUIDExists(studyUid):
+    for workitem in WORKITEMS.values():
+        if studyUid == workitem['0020000D']['Value'][0]:
+            return True
+    return False
+
+# Check a new/update workitem object to have the bare-minimum attributes
+def checkRequiredTagsPresent(workitem):
+    missingAttributes = []
+    for key in REQUIRED_TAGS:
+        if key not in workitem:
+            missingAttributes.append(key)
+    return missingAttributes

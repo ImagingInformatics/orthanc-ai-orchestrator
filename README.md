@@ -4,6 +4,13 @@ for AI pipeline "workitems"). This is an example implementation for demonstratio
 purposes only at this point. It may evolve into a more mature product over time, 
 but right now, it is 100% work in progress.
 
+## How does it work? (tl;dr)
+1. Create "workitems" (ie job ticket) via one of two ways:
+    1. Uploading a study into Orthanc (triggers will automatically create a new workitem)
+    2. Manually create your own worklitem
+2. Retrieve workitems via `/workitems/` for a full list or `workitem/xxx` for a specific one
+3. Update the state of an existing work item from SCHEDULE to IN PROGRESS, COMPLETED or CANCELED.
+
 ---
 
 # Usage
@@ -43,6 +50,15 @@ values:
 * IN PROGRESS
 * CANCELED
 * COMPLETED
+
+### Manually creating a workitem
+Perform an HTTP POST to
+
+`http://localhost:8042/ai-orchestrator/workitems/`
+
+The body of your request should be a DICOM JSON object, similar to what you would 
+get when doing an HTTP GET to `/workitems/xxx` (i.e. you can take that as a template
+and modify it to fit your needs). 
 
 ---
 # Credits
